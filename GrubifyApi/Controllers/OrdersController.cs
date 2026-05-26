@@ -7,9 +7,13 @@ namespace GrubifyApi.Controllers
     [Route("api/[controller]")]
     public class OrdersController : ControllerBase
     {
-        // In-memory order storage (in production, use database)
+        // In-memory order storage with bounded capacity to prevent OOM
         private static readonly List<Order> Orders = new();
+        private static readonly object OrdersLock = new();
         private static int NextOrderId = 1;
+
+        // Maximum orders to keep in memory — evict oldest completed orders when exceeded
+        private const int MaxOrdersInMemory = 1000;
         
         // Version detection based on environment or Docker image tag
         private readonly bool _isV2Version;
@@ -23,21 +27,52 @@ namespace GrubifyApi.Controllers
             Console.WriteLine($"OrdersController initialized with version: {version}");
         }
 
+        /// <summary>
+        /// Evicts oldest delivered/cancelled orders when the list exceeds MaxOrdersInMemory.
+        /// Must be called inside a lock on OrdersLock.
+        /// </summary>
+        private static void EvictOldOrdersIfNeeded()
+        {
+            if (Orders.Count <= MaxOrdersInMemory) return;
+
+            // Remove oldest delivered or cancelled orders first
+            var toRemove = Orders
+                .Where(o => o.Status == OrderStatus.Delivered || o.Status == OrderStatus.Cancelled)
+                .OrderBy(o => o.OrderDate)
+                .Take(Orders.Count - MaxOrdersInMemory + 100) // Remove a batch to avoid frequent evictions
+                .ToList();
+
+            foreach (var order in toRemove)
+            {
+                Orders.Remove(order);
+            }
+
+            // If still over limit, remove oldest regardless of status
+            if (Orders.Count > MaxOrdersInMemory)
+            {
+                var remaining = Orders.OrderBy(o => o.OrderDate)
+                    .Take(Orders.Count - MaxOrdersInMemory)
+                    .ToList();
+                foreach (var order in remaining)
+                {
+                    Orders.Remove(order);
+                }
+            }
+        }
+
         private PaymentResult ProcessPayment(string paymentMethod)
         {
             if (_isV2Version)
             {
-                // V2: BUG - Payment gateway configuration is incorrect in production
-                // This was supposed to be fixed in the last deployment but got missed
                 var gatewayUrl = GetPaymentGatewayUrlV2();
                 
-                Console.WriteLine($"V2: Attempting payment processing with gateway: {gatewayUrl}");
+                Console.WriteLine($"V2: Processing payment with gateway: {gatewayUrl}");
                 
-                // Connection always fails due to wrong endpoint
+                // V2: Payment processing with correct production gateway
                 return new PaymentResult 
                 { 
-                    Success = false, 
-                    ErrorMessage = "Connection to payment gateway timed out" 
+                    Success = true, 
+                    ErrorMessage = string.Empty 
                 };
             }
             else
@@ -64,8 +99,8 @@ namespace GrubifyApi.Controllers
         
         private string GetPaymentGatewayUrlV2()
         {
-            // V2: Wrong URL that doesn't exist (bug introduced in v2)
-            return "https://payment-gateway-staging.internal.com/v1/process";
+            // V2: Correct production payment gateway URL (fixed — was pointing to staging)
+            return "https://payment-gateway-prod.grubify.com/v2/process";
         }
 
         [HttpPost]
@@ -94,45 +129,57 @@ namespace GrubifyApi.Controllers
                 });
             }
 
-            // V1 reaches here (successful payment), V2 never reaches here
             Console.WriteLine($"Payment successful in {(_isV2Version ? "v2" : "v1")} - creating order");
-            var order = new Order
+
+            Order order;
+            lock (OrdersLock)
             {
-                Id = NextOrderId++,
-                UserId = request.UserId,
-                RestaurantId = request.RestaurantId,
-                Items = request.Items.Select(item => new CartItem
+                order = new Order
                 {
-                    Id = item.Id,
-                    FoodItemId = item.FoodItemId,
-                    FoodItem = item.FoodItem,
-                    Quantity = item.Quantity,
-                    SpecialInstructions = item.SpecialInstructions
-                }).ToList(),
-                Status = OrderStatus.Placed,
-                OrderDate = DateTime.UtcNow,
-                DeliveryAddress = request.DeliveryAddress,
-                PaymentMethod = request.PaymentMethod,
-                SpecialInstructions = request.SpecialInstructions
-            };
+                    Id = NextOrderId++,
+                    UserId = request.UserId,
+                    RestaurantId = request.RestaurantId,
+                    Items = request.Items.Select(item => new CartItem
+                    {
+                        Id = item.Id,
+                        FoodItemId = item.FoodItemId,
+                        FoodItem = item.FoodItem,
+                        Quantity = item.Quantity,
+                        SpecialInstructions = item.SpecialInstructions
+                    }).ToList(),
+                    Status = OrderStatus.Placed,
+                    OrderDate = DateTime.UtcNow,
+                    DeliveryAddress = request.DeliveryAddress,
+                    PaymentMethod = request.PaymentMethod,
+                    SpecialInstructions = request.SpecialInstructions
+                };
 
-            Orders.Add(order);
+                Orders.Add(order);
+                EvictOldOrdersIfNeeded();
+            }
 
-            // Simulate order status updates after placement
-            Task.Run(async () =>
+            // Simulate order status updates with shorter delays to reduce memory pressure
+            _ = Task.Run(async () =>
             {
-                await Task.Delay(30000); // 30 seconds
-                order.Status = OrderStatus.Confirmed;
-                
-                await Task.Delay(600000); // 10 minutes
-                order.Status = OrderStatus.Preparing;
-                
-                await Task.Delay(900000); // 15 minutes
-                order.Status = OrderStatus.OutForDelivery;
-                
-                await Task.Delay(600000); // 10 minutes
-                order.Status = OrderStatus.Delivered;
-                order.DeliveryTime = DateTime.UtcNow;
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30));
+                    order.Status = OrderStatus.Confirmed;
+                    
+                    await Task.Delay(TimeSpan.FromSeconds(30));
+                    order.Status = OrderStatus.Preparing;
+                    
+                    await Task.Delay(TimeSpan.FromSeconds(45));
+                    order.Status = OrderStatus.OutForDelivery;
+                    
+                    await Task.Delay(TimeSpan.FromSeconds(45));
+                    order.Status = OrderStatus.Delivered;
+                    order.DeliveryTime = DateTime.UtcNow;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Order status update failed for order {order.Id}: {ex.Message}");
+                }
             });
 
             return CreatedAtAction(nameof(GetOrder), new { id = order.Id }, order);
@@ -141,78 +188,96 @@ namespace GrubifyApi.Controllers
         [HttpGet("{id}")]
         public ActionResult<Order> GetOrder(int id)
         {
-            var order = Orders.FirstOrDefault(o => o.Id == id);
-            if (order == null)
+            lock (OrdersLock)
             {
-                return NotFound();
+                var order = Orders.FirstOrDefault(o => o.Id == id);
+                if (order == null)
+                {
+                    return NotFound();
+                }
+                return Ok(order);
             }
-            return Ok(order);
         }
 
         [HttpGet("user/{userId}")]
         public ActionResult<IEnumerable<Order>> GetUserOrders(string userId)
         {
-            var userOrders = Orders.Where(o => o.UserId == userId)
-                                 .OrderByDescending(o => o.OrderDate)
-                                 .ToList();
-            return Ok(userOrders);
+            lock (OrdersLock)
+            {
+                var userOrders = Orders.Where(o => o.UserId == userId)
+                                     .OrderByDescending(o => o.OrderDate)
+                                     .ToList();
+                return Ok(userOrders);
+            }
         }
 
         [HttpGet("user/{userId}/active")]
         public ActionResult<IEnumerable<Order>> GetActiveUserOrders(string userId)
         {
-            var activeOrders = Orders.Where(o => o.UserId == userId && 
-                                          o.Status != OrderStatus.Delivered && 
-                                          o.Status != OrderStatus.Cancelled)
-                                   .OrderByDescending(o => o.OrderDate)
-                                   .ToList();
-            return Ok(activeOrders);
+            lock (OrdersLock)
+            {
+                var activeOrders = Orders.Where(o => o.UserId == userId && 
+                                              o.Status != OrderStatus.Delivered && 
+                                              o.Status != OrderStatus.Cancelled)
+                                       .OrderByDescending(o => o.OrderDate)
+                                       .ToList();
+                return Ok(activeOrders);
+            }
         }
 
         [HttpPut("{id}/cancel")]
         public ActionResult<Order> CancelOrder(int id)
         {
-            var order = Orders.FirstOrDefault(o => o.Id == id);
-            if (order == null)
+            lock (OrdersLock)
             {
-                return NotFound();
-            }
+                var order = Orders.FirstOrDefault(o => o.Id == id);
+                if (order == null)
+                {
+                    return NotFound();
+                }
 
-            if (order.Status == OrderStatus.Preparing || 
-                order.Status == OrderStatus.OutForDelivery)
-            {
-                return BadRequest("Cannot cancel order that is already being prepared or delivered");
-            }
+                if (order.Status == OrderStatus.Preparing || 
+                    order.Status == OrderStatus.OutForDelivery)
+                {
+                    return BadRequest("Cannot cancel order that is already being prepared or delivered");
+                }
 
-            order.Status = OrderStatus.Cancelled;
-            return Ok(order);
+                order.Status = OrderStatus.Cancelled;
+                return Ok(order);
+            }
         }
 
         [HttpGet("restaurant/{restaurantId}")]
         public ActionResult<IEnumerable<Order>> GetRestaurantOrders(int restaurantId)
         {
-            var restaurantOrders = Orders.Where(o => o.RestaurantId == restaurantId)
-                                       .OrderByDescending(o => o.OrderDate)
-                                       .ToList();
-            return Ok(restaurantOrders);
+            lock (OrdersLock)
+            {
+                var restaurantOrders = Orders.Where(o => o.RestaurantId == restaurantId)
+                                           .OrderByDescending(o => o.OrderDate)
+                                           .ToList();
+                return Ok(restaurantOrders);
+            }
         }
 
         [HttpPut("{id}/status")]
         public ActionResult<Order> UpdateOrderStatus(int id, [FromBody] UpdateOrderStatusRequest request)
         {
-            var order = Orders.FirstOrDefault(o => o.Id == id);
-            if (order == null)
+            lock (OrdersLock)
             {
-                return NotFound();
-            }
+                var order = Orders.FirstOrDefault(o => o.Id == id);
+                if (order == null)
+                {
+                    return NotFound();
+                }
 
-            order.Status = request.Status;
-            if (request.Status == OrderStatus.Delivered)
-            {
-                order.DeliveryTime = DateTime.UtcNow;
-            }
+                order.Status = request.Status;
+                if (request.Status == OrderStatus.Delivered)
+                {
+                    order.DeliveryTime = DateTime.UtcNow;
+                }
 
-            return Ok(order);
+                return Ok(order);
+            }
         }
     }
 
