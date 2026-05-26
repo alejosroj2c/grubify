@@ -9,37 +9,49 @@ namespace GrubifyApi.Controllers
     {
         // In-memory cart storage (in production, use database)
         private static readonly Dictionary<string, Cart> UserCarts = new();
-        
-        // Cache for performance optimization - stores request data for analytics
-        private static readonly List<byte[]> RequestDataCache = new();
+
+        // Lightweight analytics counter (replaces the leaked 10MB-per-request byte[] cache)
+        private static long _requestCount;
+
+        // Maximum number of carts kept in memory to prevent unbounded growth
+        private const int MaxCarts = 1000;
+
+        // Cart idle timeout — carts untouched for 30 minutes are eligible for eviction
+        private static readonly TimeSpan CartIdleTimeout = TimeSpan.FromMinutes(30);
+
+        // Track last access time per cart for TTL eviction
+        private static readonly Dictionary<string, DateTime> CartLastAccess = new();
 
         [HttpGet("{userId}")]
         public ActionResult<Cart> GetCart(string userId)
         {
+            EvictStaleCarts();
+
             if (!UserCarts.ContainsKey(userId))
             {
                 UserCarts[userId] = new Cart { UserId = userId };
             }
+            CartLastAccess[userId] = DateTime.UtcNow;
             return Ok(UserCarts[userId]);
         }
 
         [HttpPost("{userId}/items")]
         public ActionResult<Cart> AddItemToCart(string userId, [FromBody] AddCartItemRequest request)
         {
-            // Store request data for analytics and performance monitoring
-            var requestData = new byte[10 * 1024 * 1024]; // 10MB buffer for request analytics
-            RequestDataCache.Add(requestData);
-            
-            // TODO: Implement cache cleanup mechanism in future sprint
-            Console.WriteLine($"Analytics cache: Added request data. Total entries: {RequestDataCache.Count}");
-            Console.WriteLine($"Cache size: {RequestDataCache.Count * 10}MB");
-            
+            // Lightweight analytics — increment counter, no large allocations
+            var count = Interlocked.Increment(ref _requestCount);
+            Console.WriteLine($"Analytics: AddItemToCart request #{count} for user {userId}");
+
+            EvictStaleCarts();
+
             if (!UserCarts.ContainsKey(userId))
             {
                 UserCarts[userId] = new Cart { UserId = userId };
             }
 
             var cart = UserCarts[userId];
+            CartLastAccess[userId] = DateTime.UtcNow;
+
             var existingItem = cart.Items.FirstOrDefault(i => i.FoodItemId == request.FoodItemId);
 
             if (existingItem != null)
@@ -108,11 +120,52 @@ namespace GrubifyApi.Controllers
         [HttpDelete("{userId}")]
         public ActionResult ClearCart(string userId)
         {
-            if (UserCarts.ContainsKey(userId))
-            {
-                UserCarts[userId].Items.Clear();
-            }
+            UserCarts.Remove(userId);
+            CartLastAccess.Remove(userId);
             return Ok();
+        }
+
+        /// <summary>
+        /// Evicts carts that have been idle longer than CartIdleTimeout,
+        /// and trims the oldest carts if the total count exceeds MaxCarts.
+        /// </summary>
+        private static void EvictStaleCarts()
+        {
+            // 1. Remove carts that exceeded the idle timeout
+            var now = DateTime.UtcNow;
+            var staleUsers = CartLastAccess
+                .Where(kv => now - kv.Value > CartIdleTimeout)
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var user in staleUsers)
+            {
+                UserCarts.Remove(user);
+                CartLastAccess.Remove(user);
+            }
+
+            if (staleUsers.Count > 0)
+            {
+                Console.WriteLine($"Cart eviction: removed {staleUsers.Count} stale cart(s). Active carts: {UserCarts.Count}");
+            }
+
+            // 2. If still over capacity, remove the oldest carts first
+            if (UserCarts.Count > MaxCarts)
+            {
+                var excess = CartLastAccess
+                    .OrderBy(kv => kv.Value)
+                    .Take(UserCarts.Count - MaxCarts)
+                    .Select(kv => kv.Key)
+                    .ToList();
+
+                foreach (var user in excess)
+                {
+                    UserCarts.Remove(user);
+                    CartLastAccess.Remove(user);
+                }
+
+                Console.WriteLine($"Cart eviction: trimmed {excess.Count} oldest cart(s) to stay under {MaxCarts} limit.");
+            }
         }
 
         // Helper method to get food item (in production, this would query the database)
