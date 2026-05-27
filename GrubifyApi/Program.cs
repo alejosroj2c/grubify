@@ -8,10 +8,13 @@ builder.Services.AddControllers();
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-// Add in-memory cache with size limit for cart storage
+// Add in-memory cache with strict size limit for cart storage
+// Hardened after OOM incident (May 26 2026): reduced from 500 to 100,
+// added compaction to auto-evict entries before hitting limit
 builder.Services.AddMemoryCache(options =>
 {
-    options.SizeLimit = 500; // Max 500 cart entries in memory
+    options.SizeLimit = 100; // Max 100 active carts in memory
+    options.CompactionPercentage = 0.25; // Evict 25% of entries when limit is reached
 });
 
 // Configure forwarded headers for Azure Container Apps

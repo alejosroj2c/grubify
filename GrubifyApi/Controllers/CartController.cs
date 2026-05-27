@@ -10,16 +10,15 @@ namespace GrubifyApi.Controllers
     {
         private readonly IMemoryCache _cache;
 
-        // Lightweight analytics counter
-        private static long _requestCount;
+        // Maximum items allowed per cart (realistic limit for food delivery)
+        private const int MaxItemsPerCart = 20;
 
-        // Maximum items allowed per cart to prevent single-user abuse
-        private const int MaxItemsPerCart = 50;
-
-        // Cache entry options: 30-min sliding expiration, size = 1 (counts toward SizeLimit)
+        // Cache entry options: shorter expiration + absolute cap to prevent memory buildup
+        // Hardened after OOM incident (May 26 2026)
         private static readonly MemoryCacheEntryOptions CacheOptions = new()
         {
-            SlidingExpiration = TimeSpan.FromMinutes(30),
+            SlidingExpiration = TimeSpan.FromMinutes(15),
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(2),
             Size = 1
         };
 
@@ -65,9 +64,11 @@ namespace GrubifyApi.Controllers
         [HttpPost("{userId}/items")]
         public ActionResult<Cart> AddItemToCart(string userId, [FromBody] AddCartItemRequest request)
         {
-            // Lightweight analytics — increment counter, no large allocations
-            var count = Interlocked.Increment(ref _requestCount);
-            Console.WriteLine($"Analytics: AddItemToCart request #{count} for user {userId}");
+            // Input validation
+            if (request.Quantity < 1 || request.Quantity > 99)
+            {
+                return BadRequest("Quantity must be between 1 and 99.");
+            }
 
             var cart = _cache.GetOrCreate(CartKey(userId), entry =>
             {
@@ -120,6 +121,11 @@ namespace GrubifyApi.Controllers
             if (item == null)
             {
                 return NotFound("Item not found in cart");
+            }
+
+            if (request.Quantity < 1 || request.Quantity > 99)
+            {
+                return BadRequest("Quantity must be between 1 and 99.");
             }
 
             item.Quantity = request.Quantity;
